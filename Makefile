@@ -16,17 +16,29 @@ else
     PIPE_DEV_NULL=
 endif
 
+##@ Variable definitions and settings
+TARGET_IMAGE_ARCH?=arm64
 ILAB_KUBE_CONTEXT?=kind-instructlab-ui
 ILAB_KUBE_NAMESPACE?=instructlab
 ILAB_KUBE_CLUSTER_NAME?=instructlab-ui
-CONTAINER_ENGINE?=docker
+CONTAINER_ENGINE?=podman
 DEVCONTAINER_BINARY_EXISTS ?= $(shell command -v devcontainer)
 TAG=$(shell git rev-parse HEAD)
+
+##@ Container Engine validation - check valid runtime
+validate-container-engine:
+ifeq ($(CONTAINER_ENGINE),docker)
+else ifeq ($(CONTAINER_ENGINE),podman)
+else
+	@echo "Error: CONTAINER_ENGINE must be either 'docker' or 'podman'." >&2
+	@exit 1
+endif
+
 ##@ Development - Helper commands for development
 .PHONY: md-lint
-md-lint: ## Lint markdown files
-	$(ECHO_PREFIX) printf "  %-12s ./...\n" "[MD LINT]"
-	$(CMD_PREFIX) docker run --rm -v $(CURDIR):/workdir docker.io/davidanson/markdownlint-cli2:v0.6.0 > /dev/null
+md-lint: validate-container-engine ## Lint markdown files
+	$(ECHO_PREFIX) printf " "[$(CONTAINER_ENGINE)]" \n %-12s ./...\n" "[MD LINT]"
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) run --rm -v $(CURDIR):/workdir docker.io/davidanson/markdownlint-cli2:v0.6.0 > /dev/null
 
 .PHONY: action-lint
 action-lint:  ## Lint GitHub Action workflows
@@ -49,16 +61,20 @@ yaml-lint: ## Lint yaml files
 	$(CMD_PREFIX) yamllint -c .yamllint.yaml deploy --strict
 
 ##@ Artifacts - Command to build and publish artifacts
-ui-image: src/Containerfile ## Build container image for the InstructLab UI
-	$(ECHO_PREFIX) printf "  %-12s src/Containerfile\n" "[docker]"
-	$(CMD_PREFIX) docker build -f src/Containerfile -t ghcr.io/instructlab/ui/ui:$(TAG) .
-	$(CMD_PREFIX) docker tag ghcr.io/instructlab/ui/ui:$(TAG) ghcr.io/instructlab/ui/ui:main
+ui-image: validate-container-engine src/Containerfile ## Build container image for the InstructLab UI
+	$(ECHO_PREFIX) printf "  %-12s src/Containerfile\n" "[$(CONTAINER_ENGINE)]"
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) build --platform linux/$(TARGET_IMAGE_ARCH) -f src/Containerfile -t quay.io/instructlab-ui/ui:$(TAG) .
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) tag quay.io/instructlab-ui/ui:$(TAG) quay.io/instructlab-ui/ui:main
 
+ps-image: validate-container-engine pathservice/Containerfile ## Build container image for the InstructLab PathService
+	$(ECHO_PREFIX) printf "  %-12s pathservice/Containerfile\n" "[$(CONTAINER_ENGINE)]"
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) build --platform linux/$(TARGET_IMAGE_ARCH) -f pathservice/Containerfile -t quay.io/instructlab-ui/pathservice:$(TAG) .
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) tag quay.io/instructlab-ui/pathservice:$(TAG) quay.io/instructlab-ui/pathservice:main
 
-ps-image: pathservice/Containerfile ## Build container image for the InstructLab PathService
-	$(ECHO_PREFIX) printf "  %-12s pathservice/Containerfile\n" "[docker]"
-	$(CMD_PREFIX) docker build -f pathservice/Containerfile -t ghcr.io/instructlab/ui/pathservice:$(TAG) .
-	$(CMD_PREFIX) docker tag ghcr.io/instructlab/ui/pathservice:$(TAG) ghcr.io/instructlab/ui/pathservice:main
+healthcheck-sidecar-image: validate-container-engine healthcheck-sidecar/Containerfile ## Build container image for the InstructLab Healthcheck-Sidecar
+	$(ECHO_PREFIX) printf "  %-12s healthcheck-sidecar/Containerfile\n" "[$(CONTAINER_ENGINE)]"
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) build --platform linux/$(TARGET_IMAGE_ARCH) -f healthcheck-sidecar/Containerfile -t quay.io/instructlab-ui/healthcheck-sidecar:$(TAG) healthcheck-sidecar
+	$(CMD_PREFIX) $(CONTAINER_ENGINE) tag quay.io/instructlab-ui/healthcheck-sidecar:$(TAG) quay.io/instructlab-ui/healthcheck-sidecar:main
 
 ##@ Local Dev - Local machine based deployment of the UI stack
 .PHONY: stop-dev-local
@@ -89,7 +105,6 @@ start-dev-podman:  ## Start UI development stack in podman
 		echo "Please create a .env file in the root of the project." ; \
 		exit 1 ; \
 	fi
-
 	$(CMD_PREFIX) yes | cp -rf .env ./deploy/compose/.env
 	$(CMD_PREFIX) podman-compose -f ./deploy/compose/ui-compose.yml up -d
 	$(CMD_PREFIX) echo "Development environment started."
@@ -112,8 +127,29 @@ check-kubectl:
 	fi
 
 .PHONY: load-images
-load-images: ## Load images onto Kind cluster
-	$(CMD_PREFIX) kind load --name $(ILAB_KUBE_CLUSTER_NAME) docker-image ghcr.io/instructlab/ui/ui:main
+load-images: validate-container-engine ## Load images onto Kind cluster
+	$(CMD_PREFIX) if [ "$(CONTAINER_ENGINE)" == "podman" ]; then \
+		echo "Note: Despite being better, podman strugles loading images to kind. Consider using docker for this." ; \
+		echo "Loading image: quay.io/instructlab-ui/ui:main ..." ; \
+		$(CONTAINER_ENGINE) save -o ./ui-image.tar quay.io/instructlab-ui/ui:main ; \
+		kind load --name $(ILAB_KUBE_CLUSTER_NAME) image-archive ./ui-image.tar ; \
+		rm -f ./ui-image.tar ; \
+		echo "Loading image: quay.io/instructlab-ui/healthcheck-sidecar:main ..." ; \
+		$(CONTAINER_ENGINE) save -o ./healthcheck-sidecar-image.tar quay.io/instructlab-ui/healthcheck-sidecar:main ; \
+		kind load --name $(ILAB_KUBE_CLUSTER_NAME) image-archive ./healthcheck-sidecar-image.tar ; \
+		rm -f ./healthcheck-sidecar-image.tar ; \
+		echo "Loading image: quay.io/instructlab-ui/pathservice:main ..." ; \
+		$(CONTAINER_ENGINE) save -o ./pathservice.tar quay.io/instructlab-ui/pathservice:main ; \
+		kind load --name $(ILAB_KUBE_CLUSTER_NAME) image-archive ./pathservice.tar ; \
+		rm -f ./pathservice.tar ; \
+	elif [ "$(CONTAINER_ENGINE)" == "podman" ]; then \
+		kind load --name $(ILAB_KUBE_CLUSTER_NAME) docker-image quay.io/instructlab-ui/ui:main ; \
+		kind load --name $(ILAB_KUBE_CLUSTER_NAME) docker-image quay.io/instructlab-ui/healthcheck-sidecar:main ; \
+		kind load --name $(ILAB_KUBE_CLUSTER_NAME) docker-image quay.io/instructlab-ui/pathservice:main ; \
+	else \
+		echo "Unrecognized CONTAINER_ENGINE value: $(CONTAINER_ENGINE)." ; \
+		exit 1 ; \
+	fi;
 
 .PHONY: stop-dev-kind
 stop-dev-kind: check-kind ## Stop the Kind cluster to destroy the development environment
@@ -124,6 +160,7 @@ setup-kind: check-kind check-kubectl stop-dev-kind ## Create a Kind cluster with
 	$(CMD_PREFIX) kind create cluster --config ./deploy/k8s/overlays/kind/kind.yaml
 	$(CMD_PREFIX) kubectl cluster-info
 	$(CMD_PREFIX) kubectl --context=$(ILAB_KUBE_CONTEXT) apply -f ./deploy/k8s/overlays/kind/kind-ingress.yaml
+	$(CMD_PREFIX) $(MAKE) load-images
 
 .PHONY: wait-for-readiness
 wait-for-readiness: # Wait for operators to be ready
